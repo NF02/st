@@ -1,6 +1,6 @@
 # st
 Il mio fork di <a href="https://st.suckless.org">st (*simple terminal*)</a> con alcune modifiche e patchs.
-<img href="https://raw.githubusercontent.com/NF02/st/master/screenshot.png">
+<img src="https://raw.githubusercontent.com/NF02/st/master/screenshot.png">
 ## patch
 - **alpha**
 - **color emoji support**
