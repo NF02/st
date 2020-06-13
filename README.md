@@ -1,4 +1,4 @@
-# st
+# st - the simple (suckless) terminal
 Il mio fork di <a href="https://st.suckless.org">st (*simple terminal*)</a> con alcune modifiche e patchs.
 <img src="https://raw.githubusercontent.com/NF02/st/master/screenshot.png">
 st è alla versione 0.8.3
