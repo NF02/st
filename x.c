@@ -268,6 +268,8 @@ static char *opt_line  = NULL;
 static char *opt_name  = NULL;
 static char *opt_title = NULL;
 
+static int focused = 0;
+
 static int oldbutton = 3; /* button event on startup: 3 = release */
 
 void
@@ -789,34 +791,37 @@ xloadcolor(int i, const char *name, Color *ncolor)
 }
 
 void
+xloadalpha(void)
+{
+	float const usedAlpha = focused ? alpha : alphaUnfocused;
+	if (opt_alpha) alpha = strtof(opt_alpha, NULL);
+	dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * usedAlpha);
+	dc.col[defaultbg].pixel &= 0x00FFFFFF;
+	dc.col[defaultbg].pixel |= (unsigned char)(0xff * usedAlpha) << 24;
+}
+
+void
 xloadcols(void)
 {
-	int i;
 	static int loaded;
 	Color *cp;
 
-	if (loaded) {
-		for (cp = dc.col; cp < &dc.col[dc.collen]; ++cp)
-			XftColorFree(xw.dpy, xw.vis, xw.cmap, cp);
-	} else {
-		dc.collen = MAX(LEN(colorname), 256);
-		dc.col = xmalloc(dc.collen * sizeof(Color));
+	if (!loaded) {
+		dc.collen = 1 + (defaultbg = MAX(LEN(colorname), 256));
+		dc.col = xmalloc((dc.collen) * sizeof(Color));
 	}
 
-	for (i = 0; i < dc.collen; i++)
+	for (int i = 0; i+1 < dc.collen; ++i)
 		if (!xloadcolor(i, NULL, &dc.col[i])) {
 			if (colorname[i])
 				die("could not allocate color '%s'\n", colorname[i]);
 			else
 				die("could not allocate color %d\n", i);
 		}
+	if (dc.collen) // cannot die, as the color is already loaded.
+		xloadcolor(focused ?bg :bgUnfocused, NULL, &dc.col[defaultbg]);
 
-	/* set alpha value of bg color */
-	if (opt_alpha)
-		alpha = strtof(opt_alpha, NULL);
-	dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * alpha);
-	dc.col[defaultbg].pixel &= 0x00FFFFFF;
-	dc.col[defaultbg].pixel |= (unsigned char)(0xff * alpha) << 24;
+	xloadalpha();
 	loaded = 1;
 }
 
@@ -1555,8 +1560,9 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 	/* draw the new one */
 	if (IS_SET(MODE_FOCUSED)) {
 		switch (win.cursor) {
-		case 7: /* st extension: snowman (U+2603) */
-			g.u = 0x2603;
+		case 7: /* st extension */
+			g.u = 0x2603; /* snowman (U+2603) */
+			/* FALLTHROUGH */
 		case 0: /* Blinking Block */
 		case 1: /* Blinking Block (Default) */
 		case 2: /* Steady Block */
@@ -1718,8 +1724,7 @@ xsetmode(int set, unsigned int flags)
 int
 xsetcursor(int cursor)
 {
-	DEFAULT(cursor, 1);
-	if (!BETWEEN(cursor, 0, 6))
+	if (!BETWEEN(cursor, 0, 7)) /* 7: st extension */
 		return 1;
 	win.cursor = cursor;
 	return 0;
@@ -1759,12 +1764,22 @@ focus(XEvent *ev)
 		xseturgency(0);
 		if (IS_SET(MODE_FOCUS))
 			ttywrite("\033[I", 3, 0);
+		if (!focused) {
+			focused = 1;
+			xloadcols();
+			redraw();
+		}
 	} else {
 		if (xw.ime.xic)
 			XUnsetICFocus(xw.ime.xic);
 		win.mode &= ~MODE_FOCUSED;
 		if (IS_SET(MODE_FOCUS))
 			ttywrite("\033[O", 3, 0);
+		if (focused) {
+			focused = 0;
+			xloadcols();
+			redraw();
+		}
 	}
 }
 
@@ -1896,10 +1911,9 @@ run(void)
 	XEvent ev;
 	int w = win.w, h = win.h;
 	fd_set rfd;
-	int xfd = XConnectionNumber(xw.dpy), xev, blinkset = 0, dodraw = 0;
-	int ttyfd;
-	struct timespec drawtimeout, *tv = NULL, now, last, lastblink;
-	long deltatime;
+	int xfd = XConnectionNumber(xw.dpy), ttyfd, xev, drawing;
+	struct timespec seltv, *tv, now, lastblink, trigger;
+	double timeout;
 
 	/* Waiting for window mapping */
 	do {
@@ -1920,82 +1934,77 @@ run(void)
 	ttyfd = ttynew(opt_line, shell, opt_io, opt_cmd);
 	cresize(w, h);
 
-	clock_gettime(CLOCK_MONOTONIC, &last);
-	lastblink = last;
-
-	for (xev = actionfps;;) {
+	for (timeout = -1, drawing = 0, lastblink = (struct timespec){0};;) {
 		FD_ZERO(&rfd);
 		FD_SET(ttyfd, &rfd);
 		FD_SET(xfd, &rfd);
+
+		if (XPending(xw.dpy))
+			timeout = 0;  /* existing events might not set xfd */
+
+		seltv.tv_sec = timeout / 1E3;
+		seltv.tv_nsec = 1E6 * (timeout - 1E3 * seltv.tv_sec);
+		tv = timeout >= 0 ? &seltv : NULL;
 
 		if (pselect(MAX(xfd, ttyfd)+1, &rfd, NULL, NULL, tv, NULL) < 0) {
 			if (errno == EINTR)
 				continue;
 			die("select failed: %s\n", strerror(errno));
 		}
-		if (FD_ISSET(ttyfd, &rfd)) {
-			ttyread();
-			if (blinktimeout) {
-				blinkset = tattrset(ATTR_BLINK);
-				if (!blinkset)
-					MODBIT(win.mode, 0, MODE_BLINK);
-			}
-		}
-
-		if (FD_ISSET(xfd, &rfd))
-			xev = actionfps;
-
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		drawtimeout.tv_sec = 0;
-		drawtimeout.tv_nsec =  (1000 * 1E6)/ xfps;
-		tv = &drawtimeout;
 
-		dodraw = 0;
-		if (blinktimeout && TIMEDIFF(now, lastblink) > blinktimeout) {
-			tsetdirtattr(ATTR_BLINK);
-			win.mode ^= MODE_BLINK;
-			lastblink = now;
-			dodraw = 1;
-		}
-		deltatime = TIMEDIFF(now, last);
-		if (deltatime > 1000 / (xev ? xfps : actionfps)) {
-			dodraw = 1;
-			last = now;
+		if (FD_ISSET(ttyfd, &rfd))
+			ttyread();
+
+		xev = 0;
+		while (XPending(xw.dpy)) {
+			xev = 1;
+			XNextEvent(xw.dpy, &ev);
+			if (XFilterEvent(&ev, None))
+				continue;
+			if (handler[ev.type])
+				(handler[ev.type])(&ev);
 		}
 
-		if (dodraw) {
-			while (XPending(xw.dpy)) {
-				XNextEvent(xw.dpy, &ev);
-				if (XFilterEvent(&ev, None))
-					continue;
-				if (handler[ev.type])
-					(handler[ev.type])(&ev);
+		/*
+		 * To reduce flicker and tearing, when new content or event
+		 * triggers drawing, we first wait a bit to ensure we got
+		 * everything, and if nothing new arrives - we draw.
+		 * We start with trying to wait minlatency ms. If more content
+		 * arrives sooner, we retry with shorter and shorter periods,
+		 * and eventually draw even without idle after maxlatency ms.
+		 * Typically this results in low latency while interacting,
+		 * maximum latency intervals during `cat huge.txt`, and perfect
+		 * sync with periodic updates from animations/key-repeats/etc.
+		 */
+		if (FD_ISSET(ttyfd, &rfd) || xev) {
+			if (!drawing) {
+				trigger = now;
+				drawing = 1;
 			}
+			timeout = (maxlatency - TIMEDIFF(now, trigger)) \
+			          / maxlatency * minlatency;
+			if (timeout > 0)
+				continue;  /* we have time, try to find idle */
+		}
 
-			draw();
-			XFlush(xw.dpy);
-
-			if (xev && !FD_ISSET(xfd, &rfd))
-				xev--;
-			if (!FD_ISSET(ttyfd, &rfd) && !FD_ISSET(xfd, &rfd)) {
-				if (blinkset) {
-					if (TIMEDIFF(now, lastblink) \
-							> blinktimeout) {
-						drawtimeout.tv_nsec = 1000;
-					} else {
-						drawtimeout.tv_nsec = (1E6 * \
-							(blinktimeout - \
-							TIMEDIFF(now,
-								lastblink)));
-					}
-					drawtimeout.tv_sec = \
-					    drawtimeout.tv_nsec / 1E9;
-					drawtimeout.tv_nsec %= (long)1E9;
-				} else {
-					tv = NULL;
-				}
+		/* idle detected or maxlatency exhausted -> draw */
+		timeout = -1;
+		if (blinktimeout && tattrset(ATTR_BLINK)) {
+			timeout = blinktimeout - TIMEDIFF(now, lastblink);
+			if (timeout <= 0) {
+				if (-timeout > blinktimeout) /* start visible */
+					win.mode |= MODE_BLINK;
+				win.mode ^= MODE_BLINK;
+				tsetdirtattr(ATTR_BLINK);
+				lastblink = now;
+				timeout = blinktimeout;
 			}
 		}
+
+		draw();
+		XFlush(xw.dpy);
+		drawing = 0;
 	}
 }
 
@@ -2070,7 +2079,7 @@ main(int argc, char *argv[])
 {
 	xw.l = xw.t = 0;
 	xw.isfixed = False;
-	win.cursor = cursorshape;
+	xsetcursor(cursorshape);
 
 	ARGBEGIN {
 	case 'a':
@@ -2135,6 +2144,7 @@ run:
 	config_init();
 	cols = MAX(cols, 1);
 	rows = MAX(rows, 1);
+	defaultbg = MAX(LEN(colorname), 256);
 	tnew(cols, rows);
 	xinit(cols, rows);
 	xsetenv();
