@@ -3,7 +3,7 @@ Il mio fork di <a href="https://st.suckless.org">st (*simple terminal*)</a> con 
 <img src="https://raw.githubusercontent.com/NF02/st/master/screenshot.png">
 st è alla versione 0.8.3
 ## patch
-- **alpha + focus**
+- **alpha**
 - **color emoji support**
 - **scroll integration**
 - **xrdb color support**
